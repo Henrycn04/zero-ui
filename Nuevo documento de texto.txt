@@ -17,3 +17,4 @@ v7: x con s2 y esc1-2-3-4
 v9: s2
 v10: s1(data augmentation) y s2
 v11: 96x96 - s2 (muy bueno en probabilidad de apuntado)
+v12: underfit s2 y esc1-2-3-4 96-96
