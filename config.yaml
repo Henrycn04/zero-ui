@@ -1,0 +1,21 @@
+capture:
+  far_mm: 4000
+  near_mm: 300
+grid:
+  cols: 3
+mqtt:
+  host: ''
+  password: ''
+  port: 1883
+  topic_prefix: home/pointing
+  username: ''
+zones:
+- A1
+- A2
+- A3
+- B1
+- B2
+- B3
+- C1
+- C2
+- C3

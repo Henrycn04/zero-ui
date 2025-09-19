@@ -1,0 +1,19 @@
+Datasets
+s1: Dataset edificio Viejo, con distribucion 33-33-33
+s2: Dataset overfit lab (con csv que lo balancea).
+s3: esc1: en el lab (2020 imagenes)
+esc2: pasillo de oficinas de profes
+esc3: esquina del pasillo del piso 4
+esc4: lab de prof kryscia y prof ariel
+
+
+Versiones
+v3: overfit con s2 que detecta bien lados y detecta C2
+v4: underfit con s1
+v5: underfit con s1 y s2 (usó dos veces s1 por .csv malo), no detecta ninguna zona
+v6: underfit con esc1-2-3-4, detecta pres baja y point bajo, solo algunas zonas las detecta en ángulos específicos (variar próximos ángulos)
+v7: x con s2 y esc1-2-3-4
+
+v9: s2
+v10: s1(data augmentation) y s2
+v11: 96x96 - s2 (muy bueno en probabilidad de apuntado)

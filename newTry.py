@@ -395,7 +395,14 @@ class TrainConfig:
 
 class DepthPointingDataset(Dataset):
     def __init__(self, csv_path: str, cfg: TrainConfig):
-        self.df = pd.read_csv(csv_path).dropna()
+        if isinstance(csv_path, (list, tuple)):
+            dfs = []
+            for p in csv_path:
+                df_i = pd.read_csv(p)
+                dfs.append(df_i)
+            self.df = pd.concat(dfs, ignore_index=True).dropna()
+        else:
+            self.df = pd.read_csv(csv_path).dropna()
         self.cfg = cfg
         for col in ['path','presence','pointing','target']:
             assert col in self.df.columns, f"Falta columna {col} en {csv_path}"
@@ -582,7 +589,13 @@ def train_model(args):
     )
 
     # === Split 80/20 por índice (reproducible) ===
-    full_df = pd.read_csv(args.data_csv).dropna()
+    # === Unir uno o varios CSVs ===
+    if isinstance(args.data_csv, (list, tuple)):
+        dfs = [pd.read_csv(p).dropna() for p in args.data_csv]
+        full_df = pd.concat(dfs, ignore_index=True)
+    else:
+        full_df = pd.read_csv(args.data_csv).dropna()
+
     idx = np.arange(len(full_df));
     np.random.shuffle(idx)
     n = len(idx);
@@ -614,11 +627,11 @@ def train_model(args):
     )
 
     best_val = float('inf');
-    best_path = outdir / 'best.pt'
     best_thr_pres, best_thr_point = 0.50, 0.50
     patience, bad = int(args.patience), 0
 
     for ep in range(1, args.epochs+1):
+        best_path = outdir / ("best" + str(ep) + ".pt")
         model.train()
         tr_losses = []
         for batch in dl_train:
@@ -1071,7 +1084,7 @@ def live(args):
     # Zonas/grid desde el checkpoint (fallback a config si no existen)
     zones = ckpt.get('zones', zones_cfg)
     grid_cols = int(ckpt.get('grid_cols', cfg_grid_cols))
-    input_sz = int(ckpt.get('input', cfg_all.get('input', 224)))
+    input_sz = int(ckpt.get('input', cfg_all.get('input', 96)))
 
     cap = cfg_all.get('capture', {})
     near_mm = int(ckpt.get('near_mm', cap.get('near_mm', 300)))
@@ -1377,7 +1390,8 @@ def parse_args():
 
     # train
     ptr = sub.add_parser('train')
-    ptr.add_argument('--data-csv', type=str, required=True)
+    ptr.add_argument('--data-csv', type=str, nargs='+', required=True,
+                     help='Ruta(s) a uno o varios labels.csv (acepta 1 o más).')
     ptr.add_argument('--epochs', type=int, default=40)  # ↑
     ptr.add_argument('--batch', type=int, default=32)  # si cabe
     ptr.add_argument('--lr', type=float, default=3e-4)  # ↑
