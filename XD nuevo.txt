@@ -1,4 +1,4 @@
 Sirve, a pesar del reguero de warnings, cambiar el dataset los podría quitar
 python newTry.py train --data-csv data/s1/labels_balanced_varied.csv --epochs 30 --batch 64 --lr 3e-4 --input 256 --near 300 --far 4000 --out runs/exp_balanced_v3
-python newTry.py live --weights runs/exp_balanced_v11/best.pt --ema 0.20 --stable-frames 4 --th-pres 0.206 --th-point 0.245 --no-calib
+python newTry.py live --weights runs/exp_balanced_v12/best.pt --ema 0.20 --stable-frames 4 --th-pres 0.206 --th-point 0.245 --no-calib
 python toggle_daemon.py
