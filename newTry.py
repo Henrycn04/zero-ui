@@ -78,6 +78,7 @@ def binary_focal_with_logits(logits, targets, alpha=0.25, gamma=2.0, reduction='
         return loss.sum()
     return loss
 
+
 # --- Carga adaptativa de checkpoints (tolera cambios en #clases) ---
 def _smart_init(shape, device, dtype):
     t = torch.empty(shape, dtype=dtype, device=device)
@@ -337,10 +338,22 @@ class ConvBlock(nn.Module):
         x = self.pool(x)
         return x
 
+# === Helper para CoordConv: concatena mapas X,Y normalizados [-1,1] ===
+class AddXY(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        # x: [B,1,H,W] -> [B,3,H,W]
+        B, _, H, W = x.shape
+        yy = torch.linspace(-1, 1, steps=H, device=x.device).view(1,1,H,1).expand(B,1,H,W)
+        xx = torch.linspace(-1, 1, steps=W, device=x.device).view(1,1,1,W).expand(B,1,H,W)
+        return torch.cat([x, xx, yy], dim=1)
+
+
 class DepthPointingNet(nn.Module):
     """
     Backbone CNN simple (>3 capas):
-      [ConvBlock(1->16)] -> [ConvBlock(16->32)] -> [ConvBlock(32->64)] -> [ConvBlock(64->128)]
+      (stem1: 1->16) ó (addXY + stem3: 3->16)  -> [ConvBlock(16->32)] -> [ConvBlock(32->64)] -> [ConvBlock(64->128)]
       GAP -> heads
     Heads:
       - presence: 1 logit
@@ -349,34 +362,53 @@ class DepthPointingNet(nn.Module):
       - row: (R+1) clases (0 = none)
       - col: (C+1) clases (0 = none)
     """
-    def __init__(self, num_targets: int, grid_cols: int = 3):
+    def __init__(self, num_targets: int, grid_cols: int = 3, use_coord: bool = False):
         super().__init__()
         self.num_targets = num_targets
         self.grid_cols = max(1, int(grid_cols))
         self.num_rows = max(1, math.ceil(num_targets / self.grid_cols)) if num_targets > 0 else 1
 
-        self.backbone = nn.Sequential(
-            ConvBlock(1, 16),  # 1
-            ConvBlock(16, 32), # 2
-            ConvBlock(32, 64), # 3
-            ConvBlock(64, 128) # 4
-        )
+        # --- CoordConv ---
+        self.use_coord = bool(use_coord)
+        self.addxy = AddXY()                 # añade canales X,Y si use_coord=True
+        self.stem1 = ConvBlock(1, 16)        # entrada estándar 1 canal (depth)
+        self.stem3 = ConvBlock(3, 16)        # entrada 3 canales (depth + X + Y)
+
+        # Resto del backbone (a partir de 16 canales)
+        self.block2 = ConvBlock(16, 32)
+        self.block3 = ConvBlock(32, 64)
+        self.block4 = ConvBlock(64, 128)
+
         self.gap = nn.AdaptiveAvgPool2d(1)
+
+        # Heads
         self.presence = nn.Linear(128, 1)
         self.pointing = nn.Linear(128, 1)
-        self.target = nn.Linear(128, num_targets + 1)       # 0..K
-        self.row    = nn.Linear(128, self.num_rows + 1)     # 0..R
-        self.col    = nn.Linear(128, self.grid_cols + 1)    # 0..C
+        self.target   = nn.Linear(128, num_targets + 1)   # 0..K
+        self.row      = nn.Linear(128, self.num_rows + 1) # 0..R
+        self.col      = nn.Linear(128, self.grid_cols + 1)# 0..C
+
     def forward(self, x):
-        f = self.backbone(x)
-        f = self.gap(f).flatten(1)
+        # x: [B,1,H,W]
+        if self.use_coord:
+            x = self.addxy(x)     # [B,3,H,W]
+            x = self.stem3(x)     # 3 -> 16
+        else:
+            x = self.stem1(x)     # 1 -> 16
+
+        x = self.block2(x)        # 16 -> 32
+        x = self.block3(x)        # 32 -> 64
+        x = self.block4(x)        # 64 -> 128
+        f = self.gap(x).flatten(1)
+
         return {
-            'presence': self.presence(f), # logits
-            'pointing': self.pointing(f), # logits
-            'target':   self.target(f),   # logits
-            'row':      self.row(f),      # logits
-            'col':      self.col(f)       # logits
+            'presence': self.presence(f),  # logits
+            'pointing': self.pointing(f),  # logits
+            'target':   self.target(f),    # logits
+            'row':      self.row(f),       # logits
+            'col':      self.col(f)        # logits
         }
+
 
 
 # ======================== Dataset y DataLoader ======================
@@ -562,6 +594,7 @@ def masked_losses(outputs, y_presence, y_pointing, y_target, y_row=None, y_col=N
 
 
 def train_model(args):
+    import numpy as np
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     outdir = Path(args.out); ensure_dir(outdir)
 
@@ -630,7 +663,7 @@ def train_model(args):
     dl_val = DataLoader(ds_val, batch_size=args.batch, shuffle=False, num_workers=0)
 
     # Modelo + opt
-    model = DepthPointingNet(num_targets=num_targets, grid_cols=grid_cols).to(device)
+    model = DepthPointingNet(num_targets=num_targets, grid_cols=grid_cols, use_coord=args.coordconv).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode='min', factor=0.5, patience=2, min_lr=1e-5
@@ -878,6 +911,7 @@ def train_model(args):
 
         print(f"[Ep {ep:03d}] train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
               f"Prec[pres]>={precp:.3f}@{thp:.2f}  F1[point]={f1g:.3f}@{thg:.2f}")
+        import numpy as np
 
         def balanced_accuracy(y_true, y_pred):
             y_true = np.asarray(y_true)
@@ -1159,7 +1193,7 @@ def live(args):
     near_mm = int(ckpt.get('near_mm', cap.get('near_mm', 300)))
     far_mm = int(ckpt.get('far_mm', cap.get('far_mm', 4000)))
     # Modelo
-    model = DepthPointingNet(num_targets=len(zones), grid_cols=grid_cols).to(device)
+    model = DepthPointingNet(num_targets=len(zones), grid_cols=grid_cols, use_coord=args.coordconv).to(device)
     state = ckpt.get('model', ckpt)
     calib_pres = None if getattr(args, 'no_calib', False) else ckpt.get('calib_presence', None)
     calib_point = None if getattr(args, 'no_calib', False) else ckpt.get('calib_pointing', None)
@@ -1230,6 +1264,10 @@ def live(args):
         return d16
 
     try:
+        last_col, last_row = 0, 0
+        last_pcol = None
+        last_prow = None
+
         while True:
             frames = pipeline.wait_for_frames()
             if align is not None:
@@ -1315,10 +1353,55 @@ def live(args):
                 # Distribuciones de columna y fila
                 p_col = torch.softmax(out['col'][0], dim=-1) if 'col' in out else None
                 p_row = torch.softmax(out['row'][0], dim=-1) if 'row' in out else None
+                # --- Ensamble con target agrupado (col/row) ---
+                Kc = int(grid_cols)
+                pt = torch.softmax(out['target'][0], dim=-1)  # [K+1], 0=none
+
+                # Agrupa probas de target por columna y por fila (ignorando clase 0)
+                C = Kc
+                R = (len(pt) - 1 + Kc - 1) // Kc  # ceil(K/Kc)
+                p_col_t = torch.zeros(C + 1, device=pt.device)  # 0..C
+                p_row_t = torch.zeros(R + 1, device=pt.device)  # 0..R
+                for k in range(1, len(pt)):
+                    r = ((k - 1) // Kc) + 1
+                    c = ((k - 1) % Kc) + 1
+                    p_col_t[c] += pt[k]
+                    p_row_t[r] += pt[k]
+                p_col_t = p_col_t / (p_col_t.sum() + 1e-6)
+                p_row_t = p_row_t / (p_row_t.sum() + 1e-6)
+
+                # Mezcla (50/50 de inicio; ajusta 0.6/0.4 si te rinde mejor)
+                p_col_ens = 0.5 * p_col + 0.5 * p_col_t
+                p_row_ens = 0.5 * p_row + 0.5 * p_row_t
 
                 # Predicciones argmax (clase 0 = none)
-                col_pred = int(torch.argmax(out['col'][0]).item()) if p_col is not None else 0
-                row_pred = int(torch.argmax(out['row'][0]).item()) if p_row is not None else 0
+                col_pred = int(torch.argmax(p_col_ens).item())
+                row_pred = int(torch.argmax(p_row_ens).item())
+
+            # --- Histeresis por cabeza ---
+            MARGIN_COL = 0.12
+            MARGIN_ROW = 0.10
+            BETA = 0.6  # EMA de las distribuciones
+
+            # Inicializa memorias si es la primera vez
+            if last_pcol is None:
+                last_pcol = p_col_ens.clone()
+                last_prow = p_row_ens.clone()
+
+            # Exige margen para cambiar de columna
+            if col_pred != last_col and last_col > 0:
+                if p_col_ens[col_pred] < p_col_ens[last_col] + MARGIN_COL:
+                    col_pred = last_col
+
+            # Exige margen para cambiar de fila
+            if row_pred != last_row and last_row > 0:
+                if p_row_ens[row_pred] < p_row_ens[last_row] + MARGIN_ROW:
+                    row_pred = last_row
+
+            # Actualiza memorias (EMA vectorial)
+            last_pcol = BETA * last_pcol + (1 - BETA) * p_col_ens
+            last_prow = BETA * last_prow + (1 - BETA) * p_row_ens
+            last_col, last_row = col_pred, row_pred
 
             # Suavizado de pointing
             p_point_eff = p_point
@@ -1342,8 +1425,8 @@ def live(args):
             else:
                 # Zona por combinación col+row
                 # Confianza final = P(pointing) * max(p_col) * max(p_row)
-                mc = float(torch.max(p_col).item()) if p_col is not None else 0.0
-                mr = float(torch.max(p_row).item()) if p_row is not None else 0.0
+                mc = float(torch.max(p_col_ens).item())
+                mr = float(torch.max(p_row_ens).item())
                 conf_zone = p_point_s * mc * mr
 
                 if col_pred > 0 and row_pred > 0:
@@ -1353,25 +1436,25 @@ def live(args):
                     zone_pred = 0
 
             # Manejo de incertidumbre: si conf_zone < 0.30, marca como “incierta”
-            CONF_MIN = 0.30
+            CONF_MIN = 0.50
             uncertain = (conf_zone < CONF_MIN and zone_pred > 0)
+            zone_pred_action = zone_pred if not uncertain else 0
 
-            # Derivar fila/col desde el target
-            r_from_t = ((zone_pred - 1) // grid_cols + 1) if zone_pred > 0 else 0
-            c_from_t = ((zone_pred - 1) %  grid_cols + 1) if zone_pred > 0 else 0
 
             # --- Visualización ---
-            vis = (normalize_depth(d, near_mm, far_mm) * 255).astype(np.uint8)  # fondo completo para contexto
+            vis = (normalize_depth(d, near_mm, far_mm) * 255).astype(np.uint8)
             vis_c = cv2.applyColorMap(vis, cv2.COLORMAP_TURBO)
-            display_zone = zones[zone_pred-1] if (zone_pred > 0 and zone_pred <= len(zones)) else 'ninguna'
+
+            display_zone = zones[zone_pred - 1] if (zone_pred > 0 and zone_pred <= len(zones)) else 'ninguna'
+            unc_tag = " ?unc" if uncertain else ""
             cv2.putText(
                 vis_c,
-                f"pres:{p_pres_s:.3f} ({logit_pres:+.2f})  point:{p_point_s:.3f} ({logit_point:+.2f})  ema:{int(use_ema)}",
+                f"pres:{p_pres_s:.3f} ({logit_pres:+.2f})  point:{p_point_s:.3f} ({logit_point:+.2f})  confZ:{conf_zone:.2f}{unc_tag}  ema:{int(use_ema)}",
                 (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2
             )
             cv2.putText(
                 vis_c,
-                f"tgt:{display_zone}  [t→R{r_from_t} C{c_from_t}]  [rc:{row_pred},{col_pred}]",
+                f"tgt:{display_zone}  [rc:{row_pred},{col_pred}]  TH(P:{TH_PRES:.2f},G:{TH_POINT:.2f})",
                 (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2
             )
             cv2.imshow('LIVE depth', vis_c)
@@ -1382,55 +1465,48 @@ def live(args):
                 use_ema = not use_ema
 
             # --- Time-based hold logic (3s hold) ---
-            on_frame_valid = (p_pres_s > TH_PRES and p_point_s > TH_POINT and zone_pred > 0)
-            display_zone = zones[zone_pred - 1] if (zone_pred > 0 and zone_pred <= len(zones)) else 'ninguna'
+            on_frame_valid = (p_pres_s > TH_PRES and p_point_s > TH_POINT and zone_pred_action > 0)
+
+            display_zone = zones[zone_pred_action - 1] if (
+                        zone_pred_action > 0 and zone_pred_action <= len(zones)) else 'ninguna'
             now_ts = time.time()
 
-            # Update per-zone timers: only care about A1 and A3 (or todas si quieres)
-            # Decide si usar solo A1/A3:
-            INTEREST_ZONES = {"C1", "A3"}  # <- modifica si quieres otras zonas
+            INTEREST_ZONES = {"A1", "A3"}  # ejemplo; ajusta a lo que te interese realmente
 
-            # If current frame is valid for a zone:
             if on_frame_valid and display_zone in INTEREST_ZONES:
-                # start timer if not started
                 if hold_start_ts.get(display_zone) is None:
                     hold_start_ts[display_zone] = now_ts
                     hold_sent_flag[display_zone] = False
-                # if we've reached hold duration and not yet sent -> send
                 elapsed = now_ts - hold_start_ts[display_zone]
                 if elapsed >= HOLD_SECONDS and not hold_sent_flag[display_zone]:
-                    # avoid rapid re-sends
                     if now_ts - last_hold_sent_ts.get(display_zone, 0.0) >= MIN_SEND_INTERVAL:
-                        # publish (synchronously with retries; non-blocking if you prefer launch thread)
                         import threading
                         def _bg_publish(zone_name, p_pres, p_point, hold_s):
                             publish_zone_hold(zone_name, p_pres, p_point, hold_seconds=hold_s)
 
-                        threading.Thread(target=_bg_publish, args=(display_zone, p_pres_s, p_point_s, HOLD_SECONDS),
-                                         daemon=True).start()
+                        threading.Thread(
+                            target=_bg_publish,
+                            args=(display_zone, p_pres_s, p_point_s, HOLD_SECONDS),
+                            daemon=True
+                        ).start()
                         last_hold_sent_ts[display_zone] = now_ts
                         hold_sent_flag[display_zone] = True
                         if getattr(args, 'no_mqtt', False):
                             print(
-                                f"[{time.strftime('%H:%M:%S')}] HOLD -> zone={display_zone} sent={ok} pres={p_pres_s:.2f} point={p_point_s:.2f}")
+                                f"[{time.strftime('%H:%M:%S')}] HOLD -> zone={display_zone} pres={p_pres_s:.2f} point={p_point_s:.2f}")
                         else:
-                            # also keep existing mqtt publish (if configured) for backward compatibility
                             if client is not None:
                                 topic = mqtt_cfg.get('topic_prefix', 'home/pointing') + f"/{display_zone}"
                                 mqtt_publish(client, topic, 'ON')
             else:
-                # Not-on-frame: clear timers for that zone after an OFF_GRACE
-                # If currently had a start for that zone, wait OFF_GRACE before resetting (tolerancia)
-                # Find all interest zones for which hold_start_ts exists but now frame invalid for them, and apply grace
+                # limpieza con gracia
                 for z in INTEREST_ZONES:
-                    if hold_start_ts.get(z) is not None:
-                        # if current frame is not for z (or zone changed) and grace exceeded -> reset
-                        if display_zone != z:
-                            # if last valid time for that z was more than OFF_GRACE ago -> reset
-                            last_valid_ts = hold_start_ts[z]
-                            if last_valid_ts is not None and (now_ts - last_valid_ts) > OFF_GRACE:
-                                hold_start_ts[z] = None
-                                hold_sent_flag[z] = False
+                    if hold_start_ts.get(z) is not None and display_zone != z:
+                        last_valid_ts = hold_start_ts[z]
+                        if last_valid_ts is not None and (now_ts - last_valid_ts) > OFF_GRACE:
+                            hold_start_ts[z] = None
+                            hold_sent_flag[z] = False
+
 
 
     finally:
@@ -1513,6 +1589,7 @@ def parse_args():
     ptr.add_argument('--no-roi', action='store_true')
     ptr.add_argument('--out', type=str, required=True)
     ptr.set_defaults(func=train_model)
+    ptr.add_argument('--coordconv', action='store_true', help='Añade canales XY normalizados a la entrada')
 
     ### PATCH A1: args de pérdidas/plan A (train)
     ptr.add_argument('--lambda-pres', type=float, default=1.0, help='Peso λ1 para BCE presencia')
@@ -1541,7 +1618,7 @@ def parse_args():
     plv.add_argument('--stable-frames', type=int, default=4) #subir a 4-5
     plv.add_argument('--use-ckpt-thr', action='store_true', help='Usar umbrales guardados en el .pt')
     plv.add_argument('--no-calib', action='store_true', help='No aplicar calibración (T,b) del checkpoint')
-
+    plv.add_argument('--coordconv', action='store_true', help='Añade canales XY normalizados a la entrada')
 
     plv.set_defaults(func=live)
 
