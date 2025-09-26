@@ -566,7 +566,7 @@ def train_model(args):
     outdir = Path(args.out); ensure_dir(outdir)
 
     # === Config zonas/grid como ya lo tienes arriba ===
-    with open('config.yaml', 'r') as f:
+    with open('../config.yaml', 'r') as f:
         cfg_all = yaml.safe_load(f)
     zones = cfg_all.get('zones', [])
     grid_cols = int(cfg_all.get('grid', {}).get('cols', 3))
@@ -916,7 +916,7 @@ def capture(args):
     csv_path = out / 'labels.csv'
 
     if args.label_live:
-        with open('config.yaml','r') as f:
+        with open('../config.yaml', 'r') as f:
             cfg_all = yaml.safe_load(f)
         zones = cfg_all.get('zones', [])
         grid_cols = int(cfg_all.get('grid', {}).get('cols', 3))
@@ -1075,7 +1075,7 @@ def live(args):
     ckpt = torch.load(args.weights, map_location=device)
 
     # Config
-    with open('config.yaml','r') as f:
+    with open('../config.yaml', 'r') as f:
         cfg_all = yaml.safe_load(f)
     mqtt_cfg = cfg_all.get('mqtt', {})
     zones_cfg = cfg_all.get('zones', [])
@@ -1357,7 +1357,7 @@ def configure(args):
             'cols': args.grid_cols
         }
     }
-    with open('config.yaml','w') as f:
+    with open('../config.yaml', 'w') as f:
         yaml.safe_dump(cfg, f)
     print('config.yaml escrito con:', cfg)
 
