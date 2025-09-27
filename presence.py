@@ -4,7 +4,7 @@
 #     python presence.py train --data-csv data/s2/labels_presence.csv --epochs 30 --out runs-pre/presence_exp1
 #   Live:
 #     python presence.py live --weights runs-pre/presence_exp1/best.pt --use-ckpt-thr
-#     python presence.py live --weights runs-pre/presence_exp1/best.pt --th-pres 0.6 --no-calib
+#     python presence.py live --weights runs-pre/presence_exp2/best.pt --th-pres 0.6 --no-calib --no-roi
 
 import argparse
 import os

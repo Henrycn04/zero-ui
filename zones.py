@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 # Ejemplos de uso:
 #   Entrenar (ROI activado por defecto, recorte centrado):
-#     python pointing.py train --data-csv data/poi1/labels.csv data/s2/labels.csv --input 96 --out runs-poi/pointing_exp1
-#   Entrenar (sin ROI):
-#     python pointing.py train --data-csv data/poi1/labels.csv --no-roi --input 96 --out runs-poi/pointing_no_roi
-#   Live (usa umbral/calibración del ckpt):
-#     python pointing.py live --weights runs-poi/pointing_exp1/best.pt --use-ckpt-thr
-#   Live (umbral manual, sin calibración):
-#     python pointing.py live --weights runs-poi/pointing_exp1/best.pt --th-point 0.55 --no-calib --no-roi
+#     python zones.py train --data-csv data/z1/labels.csv data/z2/labels.csv --input 96 --out runs-z/zones_exp1
+#   Entrenar (ROI por profundidad mínima):
+#     python zones.py train --data-csv data/z*/labels.csv --roi-mode min --input 96 --out runs-z/zones_exp2
+#   Live (usa calibración del ckpt):
+#     python zones.py live --weights runs-zon/zones_exp1/best.pt --no-roi
 
 import argparse
 import os
@@ -21,8 +19,9 @@ import yaml
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
-from sklearn.metrics import roc_auc_score, precision_recall_fscore_support
+from sklearn.metrics import f1_score, roc_auc_score
 
 try:
     import pyrealsense2 as rs
@@ -73,58 +72,6 @@ def resize_keep_ratio(img: np.ndarray, out_hw: int) -> np.ndarray:
     canvas[y0:y0+new_h, x0:x0+new_w] = resized
     return canvas
 
-def best_threshold_by_f1(y_true, y_prob):
-    # Rejilla fina + candidatos reales
-    cand = np.unique(np.clip(y_prob, 1e-6, 1 - 1e-6))
-    grid = np.linspace(0.0, 1.0, 1001)
-    thresholds = np.unique(np.concatenate([cand, grid]))
-    best_thr, best_f1 = 0.5, -1.0
-    for t in thresholds:
-        y_pred = (y_prob >= t).astype(np.uint8)
-        p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='binary', zero_division=0)
-        if f1 > best_f1:
-            best_f1, best_thr = f1, t
-    return float(best_thr), float(best_f1)
-
-def best_threshold_by_precision(y_true, y_prob, min_precision=0.98):
-    cand = np.unique(np.clip(y_prob, 1e-6, 1 - 1e-6))
-    grid = np.linspace(0.0, 1.0, 1001)
-    thresholds = np.unique(np.concatenate([cand, grid]))
-    ok = []
-    for t in thresholds:
-        y_pred = (y_prob >= t).astype(np.uint8)
-        p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='binary', zero_division=0)
-        ok.append((t, p, r, f1))
-    ok = [row for row in ok if row[1] >= min_precision]
-    if not ok:
-        return best_threshold_by_f1(y_true, y_prob)[0]
-    ok.sort(key=lambda x: x[0], reverse=True)
-    return float(ok[0][0])
-
-def calibrate_scalar_logits(y_true, logits):
-    """Calibración escalar simple (T,b) minimizando BCE."""
-    y = torch.tensor(y_true, dtype=torch.float32)
-    z = torch.tensor(logits, dtype=torch.float32)
-    T = torch.tensor(1.0, requires_grad=True)
-    b = torch.tensor(0.0, requires_grad=True)
-    opt = torch.optim.LBFGS([T, b], lr=0.5, max_iter=100, line_search_fn='strong_wolfe')
-    bce = nn.BCEWithLogitsLoss()
-    def closure():
-        opt.zero_grad()
-        zz = z / (T.abs() + 1e-6) + b
-        loss = bce(zz, y)
-        loss.backward()
-        return loss
-    try: opt.step(closure)
-    except Exception: pass
-    Tv = float(T.detach().abs().item()); bv = float(b.detach().item())
-    if not np.isfinite(Tv) or Tv < 1e-3: Tv = 1.0
-    if not np.isfinite(bv): bv = 0.0
-    return Tv, bv
-
-def apply_calib(logits, T=1.0, b=0.0):
-    return logits / max(T, 1e-6) + b
-
 def device_auto():
     return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -159,10 +106,10 @@ def crop_roi_min_depth(d16: np.ndarray, side_px: int) -> np.ndarray:
 
 # ============================== Dataset ==============================
 
-class PointingDataset(Dataset):
+class ZonesDataset(Dataset):
     """
-    CSV(s) con columnas: path, pointing (y opcional presence/row/column/target que se ignoran aquí).
-    Etiqueta: y = pointing (0/1).
+    CSV(s) con columnas: path, target (otras columnas se ignoran).
+    Etiqueta: target (string).
     ROI opcional (por defecto activado): center o min.
     """
     def __init__(self, csv_paths, input_size=96, near_mm=300, far_mm=4000,
@@ -176,13 +123,22 @@ class PointingDataset(Dataset):
         if root_dir is not None:
             df['path'] = df['path'].apply(lambda p: str(Path(root_dir) / p) if not os.path.isabs(p) else p)
 
-        needed = ['path', 'pointing']
+        needed = ['path', 'target']
         for c in needed:
             if c not in df.columns:
                 raise ValueError(f'Falta columna {c} en CSV.')
 
         # Mantener solo archivos existentes
         df = df[df['path'].apply(lambda p: os.path.exists(p))].reset_index(drop=True)
+
+        # Normalizar etiqueta a string
+        df['target'] = df['target'].astype(str)
+
+        # Clases (orden alfabético estable)
+        classes = sorted(df['target'].unique().tolist())
+        self.class_to_idx = {c: i for i, c in enumerate(classes)}
+        self.idx_to_class = {i: c for c, i in self.class_to_idx.items()}
+        df = df[df['target'].isin(self.class_to_idx.keys())].reset_index(drop=True)
 
         self.df = df
         self.input_size = int(input_size)
@@ -209,7 +165,8 @@ class PointingDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         path = row['path']
-        y = int(row['pointing'])
+        y_lbl = str(row['target'])
+        y = self.class_to_idx[y_lbl]
 
         img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
         if img is None:
@@ -222,14 +179,14 @@ class PointingDataset(Dataset):
         x = resize_keep_ratio(x, self.input_size)
         x = np.expand_dims(x, axis=0)
         x = torch.from_numpy(x).float()
-        return x, torch.tensor(y, dtype=torch.float32)
+        return x, torch.tensor(y, dtype=torch.long)
 
 
 # ============================== Modelo ==============================
 
-class SmallPointingNet(nn.Module):
-    """CNN binaria para 'apuntando' vs 'no apuntando'."""
-    def __init__(self, in_ch=1, width=32):
+class SmallZonesNet(nn.Module):
+    """CNN multiclass para zonas. Entrada (B,1,H,W) → logits (B,C)."""
+    def __init__(self, num_classes: int, in_ch=1, width=32):
         super().__init__()
         self.backbone = nn.Sequential(
             nn.Conv2d(in_ch, width, 3, padding=1), nn.BatchNorm2d(width), nn.ReLU(inplace=True),
@@ -244,37 +201,87 @@ class SmallPointingNet(nn.Module):
             nn.Conv2d(width*4, width*4, 3, padding=1), nn.BatchNorm2d(width*4), nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d((1,1)),
         )
-        self.head = nn.Linear(width*4, 1)
+        self.head = nn.Linear(width*4, num_classes)
 
     def forward(self, x):
         feat = self.backbone(x).flatten(1)
-        return self.head(feat).squeeze(1)
+        return self.head(feat)
+
+
+# ============================== Calibración (temperatura escalar) ==============================
+
+def calibrate_temperature_mc(logits_val: np.ndarray, y_true: np.ndarray):
+    """
+    Ajusta una temperatura escalar T>0 para softmax: softmax(logits/T).
+    Minimiza NLL. Devuelve T (float).
+    """
+    z = torch.tensor(logits_val, dtype=torch.float32)
+    y = torch.tensor(y_true, dtype=torch.long)
+
+    T = torch.tensor(1.0, requires_grad=True)
+    opt = torch.optim.LBFGS([T], lr=0.5, max_iter=100, line_search_fn='strong_wolfe')
+
+    def nll_with_T():
+        opt.zero_grad()
+        zz = z / (T.abs() + 1e-6)
+        logp = F.log_softmax(zz, dim=1)
+        loss = F.nll_loss(logp, y, reduction='mean')
+        loss.backward()
+        return loss
+
+    try:
+        opt.step(nll_with_T)
+    except Exception:
+        pass
+
+    Tv = float(T.detach().abs().item())
+    if not np.isfinite(Tv) or Tv < 1e-3:
+        Tv = 1.0
+    return Tv
+
+
+# ============================== Métricas ==============================
+
+@torch.no_grad()
+def evaluate(model, loader, device, num_classes: int):
+    model.eval()
+    ys, zs = [], []
+    for xb, yb in loader:
+        xb = xb.to(device); yb = yb.to(device)
+        z = model(xb)                 # (B,C)
+        ys.append(yb.cpu().numpy())
+        zs.append(z.cpu().numpy())
+    y_true = np.concatenate(ys).astype(np.int64)
+    logits = np.concatenate(zs).astype(np.float32)
+    probs  = torch.softmax(torch.from_numpy(logits), dim=1).numpy()
+
+    # ACC top-1
+    y_pred = probs.argmax(axis=1)
+    acc = float((y_pred == y_true).mean())
+
+    # F1 macro
+    f1_macro = float(f1_score(y_true, y_pred, average='macro'))
+
+    # AUC macro (OVR) si hay diversidad por clase
+    aucs = []
+    try:
+        for c in range(num_classes):
+            y_bin = (y_true == c).astype(np.int32)
+            if len(np.unique(y_bin)) < 2:
+                continue
+            aucs.append(roc_auc_score(y_bin, probs[:, c]))
+        auc_macro = float(np.mean(aucs)) if aucs else float('nan')
+    except Exception:
+        auc_macro = float('nan')
+
+    return {
+        'ACC': acc,
+        'F1m': f1_macro,
+        'AUCm': auc_macro
+    }, y_true, logits
 
 
 # ============================== Entrenamiento ==============================
-
-def evaluate(model, loader, device, use_auc=True):
-    """Calcula métricas en validación. ACC con umbral de mejor F1."""
-    model.eval()
-    ys, ps, zs = [], [], []
-    with torch.no_grad():
-        for xb, yb in loader:
-            xb = xb.to(device); yb = yb.to(device)
-            z = model(xb)
-            p = torch.sigmoid(z)
-            ys.append(yb.cpu().numpy()); ps.append(p.cpu().numpy()); zs.append(z.cpu().numpy())
-    y_true = np.concatenate(ys).astype(np.float32)
-    y_prob = np.concatenate(ps).astype(np.float32)
-    z_all  = np.concatenate(zs).astype(np.float32)
-
-    auc = roc_auc_score(y_true, y_prob) if use_auc and (len(np.unique(y_true)) > 1) else np.nan
-    thr, _ = best_threshold_by_f1(y_true, y_prob)
-    y_pred = (y_prob >= thr).astype(np.uint8)
-    p, r, f1x, _ = precision_recall_fscore_support(y_true, y_pred, average='binary', zero_division=0)
-    acc = float((y_pred == y_true.astype(np.uint8)).mean())
-
-    metrics = {'AUC': float(auc), 'thr_f1': float(thr), 'F1': float(f1x), 'P': float(p), 'R': float(r), 'ACC': float(acc)}
-    return metrics, y_true, y_prob, z_all
 
 def train(args):
     set_seed(args.seed)
@@ -282,17 +289,19 @@ def train(args):
     near = int(cfg.get('capture', {}).get('near_mm', args.near))
     far  = int(cfg.get('capture',  {}).get('far_mm',  args.far))
 
-    # Dataset
-    ds = PointingDataset(
+    # Dataset completo para definir clases
+    ds_all = ZonesDataset(
         args.data_csv, input_size=args.input, near_mm=near, far_mm=far,
         root_dir=None, use_roi=not args.no_roi, roi_mode=args.roi_mode, roi_side=args.roi_side
     )
+    classes = [ds_all.idx_to_class[i] for i in range(len(ds_all.idx_to_class))]
+    num_classes = len(classes)
 
     # Split
-    n = len(ds)
+    n = len(ds_all)
     val_n = max(1, int(round(n * args.val_ratio)))
     train_n = n - val_n
-    ds_train, ds_val = random_split(ds, [train_n, val_n], generator=torch.Generator().manual_seed(args.seed))
+    ds_train, ds_val = random_split(ds_all, [train_n, val_n], generator=torch.Generator().manual_seed(args.seed))
 
     # DataLoaders (Windows-friendly)
     loader_train = DataLoader(ds_train, batch_size=args.batch, shuffle=True, num_workers=0, pin_memory=False)
@@ -300,15 +309,10 @@ def train(args):
 
     # Modelo
     device = device_auto()
-    model = SmallPointingNet(in_ch=1, width=args.width).to(device)
+    model = SmallZonesNet(num_classes=num_classes, in_ch=1, width=args.width).to(device)
 
-    # Pérdida con pos_weight desde train
-    train_labels = [int(ds_train[i][1].item()) for i in range(len(ds_train))]
-    pos_t = sum(train_labels); neg_t = len(train_labels) - pos_t
-    pos_weight = torch.tensor([(neg_t / max(pos_t, 1))], dtype=torch.float32, device=device)
-    bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-    # Opt
+    # Pérdida y optimizador
+    ce = nn.CrossEntropyLoss()
     if args.opt == 'adam':
         opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
     else:
@@ -316,7 +320,7 @@ def train(args):
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=3)
 
     outdir = Path(args.out); ensure_dir(outdir)
-    best_val = 1e9; bad_epochs = 0; best_path = None
+    best_proxy = 1e9; bad_epochs = 0; best_path = None
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -324,62 +328,55 @@ def train(args):
         for xb, yb in loader_train:
             xb = xb.to(device); yb = yb.to(device)
             z = model(xb)
-            loss = bce(z, yb)
+            loss = ce(z, yb)
             opt.zero_grad(); loss.backward(); opt.step()
             running += float(loss.item()) * xb.size(0)
 
         train_loss = running / max(1, len(ds_train))
-        metrics_val, y_true, y_prob, z_all = evaluate(model, loader_val, device)
-        val_loss_proxy = 1.0 - metrics_val['F1']
-        scheduler.step(val_loss_proxy)
+        metrics_val, y_true_val, logits_val = evaluate(model, loader_val, device, num_classes)
+        # Proxy para early stopping: 1 - F1 macro
+        proxy = 1.0 - metrics_val['F1m']
+        scheduler.step(proxy)
 
-        print(f"[{epoch:03d}] "
-              f"train_loss={train_loss:.4f} | "
-              f"val F1={metrics_val['F1']:.4f} "
-              f"P={metrics_val['P']:.4f} "
-              f"R={metrics_val['R']:.4f} "
-              f"ACC={metrics_val['ACC']:.4f} "
-              f"AUC={metrics_val['AUC']:.4f} "
-              f"thr~{metrics_val['thr_f1']:.3f}")
+        print(f"[{epoch:03d}] train_loss={train_loss:.4f} | "
+              f"val ACC={metrics_val['ACC']:.4f} F1m={metrics_val['F1m']:.4f} AUCm={metrics_val['AUCm']:.4f}")
 
-        # Guardado "last"
+        # Guardar last
         ckpt_last = {
             'state_dict': model.state_dict(),
             'meta': {
-                'model_type': 'pointing',
+                'model_type': 'zones',
                 'input': args.input,
                 'near_mm': near,
                 'far_mm': far,
-                'zones': cfg.get('zones', []),
-                'grid_cols': int(cfg.get('grid', {}).get('cols', 3)),
                 'created_at': datetime.utcnow().isoformat() + 'Z',
+                'classes': classes,
                 'roi': {'use_roi': not args.no_roi, 'roi_mode': args.roi_mode, 'roi_side': args.roi_side},
             },
-            'calibration': None,
-            'thresholds': None,
+            'calibration': None,  # T
             'norm': {'method': 'clip_minmax', 'near_mm': near, 'far_mm': far},
         }
         torch.save(ckpt_last, outdir / 'last.pt')
 
         # Early stopping & best
-        if val_loss_proxy < best_val:
-            best_val = val_loss_proxy; bad_epochs = 0
-            # Calibración/umbral
-            try: T, b = calibrate_scalar_logits(y_true, np.asarray(z_all).reshape(-1))
-            except Exception: T, b = 1.0, 0.0
-            thr_f1, _ = best_threshold_by_f1(y_true, y_prob)
-            chosen_thr = float(thr_f1) if args.precision_target is None else float(best_threshold_by_precision(y_true, y_prob, args.precision_target))
+        if proxy < best_proxy:
+            best_proxy = proxy
+            bad_epochs = 0
+
+            # Calibración por temperatura escalar con val
+            try:
+                T = calibrate_temperature_mc(logits_val, y_true_val)
+            except Exception:
+                T = 1.0
 
             ckpt_best = ckpt_last.copy()
-            ckpt_best['calibration'] = {'T': float(T), 'b': float(b)}
-            ckpt_best['thresholds']  = {'thr': float(chosen_thr)}
+            ckpt_best['calibration'] = {'T': float(T)}
 
             best_path = outdir / 'best.pt'
             torch.save(ckpt_best, best_path)
             epoch_best_path = outdir / f'best{epoch}.pt'
             torch.save(ckpt_best, epoch_best_path)
-
-            print(f"  -> best.pt y {epoch_best_path.name} actualizados | thr={chosen_thr:.3f} | calib T={T:.3f} b={b:.3f}")
+            print(f"  -> best.pt y {epoch_best_path.name} actualizados | calib T={T:.3f}")
         else:
             bad_epochs += 1
             if bad_epochs >= args.patience:
@@ -387,8 +384,10 @@ def train(args):
                 break
 
     print("Entrenamiento finalizado.")
-    if best_path: print(f"Mejor checkpoint: {best_path}")
-    else:         print("No hubo mejora; usa last.pt.")
+    if best_path:
+        print(f"Mejor checkpoint: {best_path}")
+    else:
+        print("No hubo mejora; usa last.pt.")
 
 
 # ============================== Live ==============================
@@ -410,29 +409,32 @@ def rs_pipeline(width=640, height=480, fps=30):
 def live(args):
     ckpt = torch.load(args.weights, map_location='cpu')
     meta = ckpt.get('meta', {})
+    classes = meta.get('classes', [])
+    if not classes:
+        raise RuntimeError('El checkpoint no contiene la lista de clases.')
+    num_classes = len(classes)
+
     near = int(meta.get('near_mm', 300)); far  = int(meta.get('far_mm', 4000))
     input_size = int(meta.get('input', args.input))
     roi_info = meta.get('roi', {'use_roi': True, 'roi_mode': 'center', 'roi_side': None})
 
     device = device_auto()
-    model = SmallPointingNet(in_ch=1, width=args.width).to(device)
+    model = SmallZonesNet(num_classes=num_classes, in_ch=1, width=args.width).to(device)
     model.load_state_dict(ckpt['state_dict'], strict=False); model.eval()
 
-    thr = args.th_point
-    if args.use_ckpt_thr and ckpt.get('thresholds'):
-        thr = float(ckpt['thresholds'].get('thr', thr))
-    T = 1.0; b = 0.0
-    if not args.no_calib and ckpt.get('calibration'):
-        T = float(ckpt['calibration'].get('T', 1.0)); b = float(ckpt['calibration'].get('b', 0.0))
+    # Calibración T (si existe)
+    T = 1.0
+    if ckpt.get('calibration'):
+        T = float(ckpt['calibration'].get('T', 1.0))
 
-    # ROI runtime: por defecto usa lo del ckpt, pero puedes forzarlo por CLI
+    # ROI runtime: por defecto usa lo del ckpt, pero puedes forzarlo por CLI si quisieras extender
     use_roi = roi_info.get('use_roi', True) if args.no_roi is None else (not args.no_roi)
     roi_mode = args.roi_mode or roi_info.get('roi_mode', 'center')
     roi_side = args.roi_side if args.roi_side is not None else roi_info.get('roi_side', None)
 
     pipeline, dec, spat, temp, hole = rs_pipeline()
     try:
-        cv2.namedWindow('pointing', cv2.WINDOW_NORMAL)
+        cv2.namedWindow('zones', cv2.WINDOW_NORMAL)
 
         while True:
             frames = pipeline.wait_for_frames()
@@ -454,15 +456,18 @@ def live(args):
             vis = (x * 255.0).astype(np.uint8)
 
             xt = torch.from_numpy(np.expand_dims(x, 0)[None, ...]).float().to(device)
-            z = model(xt).cpu().numpy().reshape(-1)[0]
-            if not args.no_calib: z = apply_calib(z, T, b)
-            p = 1.0 / (1.0 + np.exp(-z)); flag = int(p >= thr)
+            z = model(xt) / max(T, 1e-6)
+            p = torch.softmax(z, dim=1).cpu().numpy()[0]  # (C,)
+            top = int(np.argmax(p))
+            zone = classes[top]
+            conf = float(p[top])
 
             hud = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
-            cv2.putText(hud, f"P={p:.3f} thr={thr:.2f} flag={flag} roi={roi_mode if use_roi else 'off'}",
+            cv2.putText(hud, f"Zone={zone} P={conf:.3f} roi={roi_mode if use_roi else 'off'}",
                         (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
-            cv2.imshow('pointing', hud)
-            if (cv2.waitKey(1) & 0xFF) == ord('q'): break
+            cv2.imshow('zones', hud)
+            if (cv2.waitKey(1) & 0^0xFF) == ord('q'): break  # ^ para evitar precedencia (igual a &)
+
     finally:
         cv2.destroyAllWindows()
         try: pipeline.stop()
@@ -472,7 +477,7 @@ def live(args):
 # ============================== CLI ==============================
 
 def build_parser():
-    p = argparse.ArgumentParser(description='Modelo de Apuntado (pointing sí/no): train + live')
+    p = argparse.ArgumentParser(description='Modelo de Zonas (multiclase): train + live')
     sub = p.add_subparsers(dest='cmd', required=True)
 
     # Train
@@ -491,10 +496,6 @@ def build_parser():
     pt.add_argument('--near', type=int, default=300)
     pt.add_argument('--far',  type=int, default=4000)
     pt.add_argument('--patience', type=int, default=7)
-    pt.add_argument('--precision-target', type=float, default=None,
-                    help='Si se define, selecciona umbral con precisión >= este valor; si no, usa mejor F1.')
-
-    # ROI (on por defecto)
     pt.add_argument('--no-roi', action='store_true', help='Desactiva ROI.')
     pt.add_argument('--roi-mode', type=str, default='center', choices=['center','min'])
     pt.add_argument('--roi-side', type=int, default=None, help='Lado del ROI en px del frame original (default 0.6*min(H,W)).')
@@ -506,11 +507,6 @@ def build_parser():
     pl.add_argument('--weights', type=str, required=True)
     pl.add_argument('--input', type=int, default=96)
     pl.add_argument('--width', type=int, default=32)
-    pl.add_argument('--th-point', type=float, default=0.5)
-    pl.add_argument('--use-ckpt-thr', action='store_true')
-    pl.add_argument('--no-calib', action='store_true')
-
-    # ROI en live (por defecto lo que trae el ckpt)
     pl.add_argument('--no-roi', action='store_true')
     pl.add_argument('--roi-mode', type=str, default=None, choices=['center','min'])
     pl.add_argument('--roi-side', type=int, default=None)
