@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Ejemplo de uso:
-#   python pipeline.py --w-pres runs-pre/presence_exp2/best.pt --w-point runs-poi/pointing_exp2/best.pt --w-zones runs-zon/zones_exp1/best.pt --no-roi
+#   python pipeline.py --w-pres runs-pre/presence_exp2/best.pt --w-point runs-poi/pointing_exp3/best.pt --w-zones runs-zon/zones_exp1/best.pt --no-roi --ha --ha-url http://127.0.0.1:5000/event
 #
 #   Desactivar ROI (pointing y zones):
 #     python pipeline.py ... --no-roi
@@ -12,12 +12,21 @@ import argparse
 from pathlib import Path
 import os
 from datetime import datetime
+import time
+import uuid
+import json
 import numpy as np
 import cv2
 import yaml
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# requests es usado para comunicarse con toggle_daemon (si --ha activo)
+try:
+    import requests
+except Exception:
+    requests = None
 
 try:
     import pyrealsense2 as rs
@@ -229,6 +238,16 @@ def live(args):
     model_zones = SmallZonesNet(num_classes=len(classes), in_ch=1, width=args.width).to(device)
     model_zones.load_state_dict(ckpt_zones['state_dict'], strict=False); model_zones.eval()
 
+    # HA integration state
+    ha_enabled = bool(args.ha)
+    ha_url = args.ha_url
+    ha_hold = float(args.ha_hold)
+    ha_source = args.ha_source
+
+    # track hold timers / dedupe per zone
+    zone_hold_start = {}   # zone -> timestamp when it started being continuously active
+    zone_sent = set()      # zones already sent while still active (to avoid re-send)
+
     # --------- Cámara ---------
     pipeline, dec, spat, temp, hole = rs_pipeline()
     try:
@@ -237,6 +256,9 @@ def live(args):
         cv2.namedWindow('zones',    cv2.WINDOW_AUTOSIZE)
 
         last_zone = ('-', 0.0)
+        # last_seen_zone variable to detect changes
+        last_seen_zone_name = None
+
         while True:
             frames = pipeline.wait_for_frames()
             depth = frames.get_depth_frame()
@@ -304,6 +326,59 @@ def live(args):
                         (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1, cv2.LINE_AA)
             cv2.imshow('zones', hud_z)
 
+            # ================ HA integration: detect hold and POST to toggle_daemon ================
+            if ha_enabled and active_zone == 1 and zone_lbl and zone_lbl != '-':
+                now = time.time()
+                prev = last_seen_zone_name
+                # if zone changed from previous, reset timer for all other zones
+                if prev != zone_lbl:
+                    # new zone seen, start timer for this zone and clear sent flags for other zones
+                    zone_hold_start[zone_lbl] = now
+                    # clear sent flags for other zones so they can be toggled again later
+                    zone_sent.discard(zone_lbl)  # ensure not marked as sent for this zone
+                    # remove any hold starts of zones not current
+                    for z in list(zone_hold_start.keys()):
+                        if z != zone_lbl:
+                            zone_hold_start.pop(z, None)
+                    last_seen_zone_name = zone_lbl
+                else:
+                    # same zone as last frame, check elapsed
+                    start_ts = zone_hold_start.get(zone_lbl, now)
+                    elapsed = now - start_ts
+                    if elapsed >= ha_hold and zone_lbl not in zone_sent:
+                        # prepare message (toggle_daemon expects msg_id, zone, event='zone_hold', hold_seconds, p_presence, p_pointing, ts)
+                        msg = {
+                            "msg_id": uuid.uuid4().hex,
+                            "source": ha_source,
+                            "zone": zone_lbl,
+                            "event": "zone_hold",
+                            "hold_seconds": float(elapsed),
+                            "p_presence": float(p_pres),
+                            "p_pointing": float(p_point),
+                            "ts": now
+                        }
+                        # send POST
+                        if requests is None:
+                            print("[HA] requests library not available; cannot POST", msg)
+                        else:
+                            try:
+                                r = requests.post(ha_url, json=msg, timeout=2.0)
+                                if 200 <= r.status_code < 300:
+                                    print(f"[HA] POST ok zone={zone_lbl} elapsed={elapsed:.2f}s -> {r.status_code}")
+                                    zone_sent.add(zone_lbl)
+                                else:
+                                    print(f"[HA] POST failed {r.status_code} -> {r.text[:200]}")
+                            except Exception as e:
+                                print(f"[HA] POST exception: {e}")
+            else:
+                # if pointing lost or no active zone, reset last_seen_zone to allow new holds later
+                if not (ha_enabled and active_zone == 1 and zone_lbl and zone_lbl != '-'):
+                    last_seen_zone_name = None
+                    # do not clear zone_sent here: we avoid re-sending while the same zone stays active repeatedly;
+                    # it will be allowed again when zone changes (see above)
+
+            # ================ end HA integration ======================================================
+
             # Salir
             if (cv2.waitKey(1) & 0xFF) == ord('q'):
                 break
@@ -341,6 +416,12 @@ def build_parser():
 
     # ROI global (afecta pointing y zones)
     p.add_argument('--no-roi', action='store_true', help='Desactiva ROI para pointing y zones (usa frame completo).')
+
+    # Home Assistant / toggle_daemon integration
+    p.add_argument('--ha', action='store_true', help='Habilita envío de eventos a toggle_daemon cuando se mantiene apuntando a una zona.')
+    p.add_argument('--ha-url', type=str, default='http://127.0.0.1:5000/event', help='URL del endpoint /event del toggle_daemon.')
+    p.add_argument('--ha-hold', type=float, default=1.5, help='Segundos que la zona debe mantenerse activa antes de enviar evento (default 1.5s).')
+    p.add_argument('--ha-source', type=str, default='pipeline', help='Campo "source" enviado en el JSON al daemon.')
 
     p.set_defaults(func=live)
     return p

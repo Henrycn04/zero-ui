@@ -37,8 +37,8 @@ import requests
 from flask import Flask, request, jsonify
 
 # --- Config (env override)
-HA_URL = os.getenv("HA_URL", "http://192.168.31.153:8123")
-HA_TOKEN = os.getenv("HA_TOKEN", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJjYzZkY2NlMjc3ODQ0MTg3YTExOTgzYzBlYjE1ZmZhYSIsImlhdCI6MTc1Njc0Njk5NiwiZXhwIjoyMDcyMTA2OTk2fQ.j1jzTDoM4qwCACk3UZxPTeEkLA8AgS_wTliFfdbXb4Q")   # MUST be set by the user
+HA_URL = os.getenv("HA_URL", "http://192.168.100.223:8123")
+HA_TOKEN = os.getenv("HA_TOKEN", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiI0ZWNjNDlkNzMwZWM0MmQ3YjRlNTdmMTU3YTQ0ZmYwMCIsImlhdCI6MTc1OTM1ODMzNiwiZXhwIjoyMDc0NzE4MzM2fQ.onc-s4T9Ca3UMBzE94FYebeUUPiajO0eYkNeDsCm03U")   # MUST be set by the user
 BIND_HOST = os.getenv("BIND_HOST", "127.0.0.1")
 BIND_PORT = int(os.getenv("BIND_PORT", "5000"))
 
@@ -48,10 +48,9 @@ RETRY_ATTEMPTS = 4
 RETRY_BACKOFF_BASE = 0.5      # seconds: 0.5,1,2,4
 REQUEST_TIMEOUT = 3.0         # seconds for HA requests
 
-# Map zone -> entity_id in HA (edit if needed)
+# Map zone -> entity_id in HA
 ZONE_TO_ENTITY = {
-    "C1": "media_player.chromecast_tv_movil",
-    "A3": "media_player.epson_4_14",   # you gave this entity
+    "9": "media_player.cuarto_tv",   # you gave this entity
 }
 
 # Logging
